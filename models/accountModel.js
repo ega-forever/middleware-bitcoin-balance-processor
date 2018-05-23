@@ -1,3 +1,9 @@
+/**
+ * Copyright 2017–2018, LaborX PTY
+ * Licensed under the AGPL Version 3 license.
+ * @author Egor Zuev <zyev.egor@gmail.com>
+ */
+
 const mongoose = require('mongoose'),
   config = require('../config'),
   messages = require('../factories/messages/addressMessageFactory');
@@ -17,6 +23,7 @@ const Account = new mongoose.Schema({
     confirmations3: {type: Number, default: 0, required: true},
     confirmations6: {type: Number, default: 0, required: true}
   },
+  isActive: {type: Boolean, required: true, default: true},
   lastBlockCheck: {type: Number, default: 0, required: true},
   lastTxs: {type: mongoose.Schema.Types.Mixed, default: [], required: true},
   created: {type: Date, required: true, default: Date.now}
