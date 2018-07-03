@@ -7,20 +7,28 @@
 require('dotenv/config');
 
 const config = require('../config'),
-  expect = require('chai').expect,
+  Promise = require('bluebird'),
+  mongoose = require('mongoose');
+
+  mongoose.Promise = Promise;
+mongoose.connect(config.mongo.data.uri, {useMongoClient: true});
+mongoose.accounts = mongoose.createConnection(config.mongo.accounts.uri, {useMongoClient: true});
+
+const  expect = require('chai').expect,
   accountModel = require('../models/accountModel'),
   ipcExec = require('./helpers/ipcExec'),
   _ = require('lodash'),
   Network = require('bcoin/lib/protocol/network'),
   bcoin = require('bcoin'),
   WebSocket = require('ws'),
+  amqp = require('amqplib'),
   Stomp = require('webstomp-client'),
-  Promise = require('bluebird'),
   ctx = {
     network: null,
     accounts: []
-  },
-  mongoose = require('mongoose');
+  };
+
+let amqpInstance;
 
 describe('core/balanceProcessor', function () {
 
@@ -48,6 +56,14 @@ describe('core/balanceProcessor', function () {
     return mongoose.disconnect();
   });
 
+  beforeEach(async () => {
+    amqpInstance = await amqp.connect(config.rabbit.url);
+  });
+
+  afterEach(async () => {
+    await amqpInstance.close();
+  });
+
   it('remove registered addresses from mongodb', async () => {
 
     let keyring = new bcoin.keyring(ctx.accounts[0].privateKey, ctx.network);
@@ -68,11 +84,13 @@ describe('core/balanceProcessor', function () {
   it('register addresses', async () => {
     for (let account of ctx.accounts) {
       let keyring = new bcoin.keyring(account.privateKey, ctx.network);
-      await new accountModel({address: keyring.getAddress().toString()})
+      const address = keyring.getAddress().toString();
+      await new accountModel({address})
         .save().catch(() => {
         });
     }
   });
+
 
   it('generate some coins for accountA', async () => {
     let keyring = new bcoin.keyring(ctx.accounts[0].privateKey, ctx.network);
@@ -90,6 +108,38 @@ describe('core/balanceProcessor', function () {
     let account = await accountModel.findOne({address: keyring.getAddress().toString()});
     ctx.amountA = account.balances.confirmations0;
     expect(account.balances.confirmations0).to.be.gt(0);
+  });
+
+  it('remove account 0 and add with zero balance', async () => {
+    let keyring = new bcoin.keyring(ctx.accounts[0].privateKey, ctx.network);
+    const address = keyring.getAddress().toString();
+    await accountModel.remove({address});
+
+    const account = await new accountModel({address})
+    .save().catch(() => {
+    });
+    expect(account.balances.confirmations0).to.be.equal(0);
+
+  });
+
+  it('send message about new account and check this balance', async () => {
+    let keyring = new bcoin.keyring(ctx.accounts[0].privateKey, ctx.network);
+    const address = keyring.getAddress().toString();
+
+
+    const channel = await amqpInstance.createChannel(); 
+    await channel.assertExchange('internal', 'topic', {durable: false});
+    await channel.publish('internal', `${config.rabbit.serviceName}_user.created`, 
+      new Buffer(JSON.stringify({
+        address
+      }))
+    );
+
+    await Promise.delay(4000);
+    const accountAfter = await accountModel.findOne({address});
+    expect(accountAfter.balances.confirmations6).to.be.greaterThan(0);
+    expect(accountAfter.balances.confirmations3).to.be.greaterThan(0);
+    expect(accountAfter.balances.confirmations0).to.be.greaterThan(0);
   });
 
   it('prepare tx for transferring coins from accountB and accountC', async () => {
@@ -133,33 +183,40 @@ describe('core/balanceProcessor', function () {
     let keyring = new bcoin.keyring(ctx.accounts[0].privateKey, ctx.network);
     let keyring2 = new bcoin.keyring(ctx.accounts[1].privateKey, ctx.network);
 
-    await new Promise(res => {
-      let confirmations = 0;
-      ctx.stompClient.subscribe(`/exchange/events/${config.rabbit.serviceName}_balance.${keyring.getAddress().toString()}`, function (message) {
-        message = JSON.parse(message.body);
+    
+    await Promise.all([
+      (async () => {
+        let confirmations = 0;
+        
+        ctx.stompClient.subscribe(`/exchange/events/${config.rabbit.serviceName}_balance.${keyring.getAddress().toString()}`, async (message) => {
+          message = JSON.parse(message.body);
 
-        if (message.tx.txid !== ctx.tx.txid())
-          return;
+          if (message.tx !== ctx.tx.txid())
+            return;
 
-        if (message.tx.confirmations === 0 || message.tx.confirmations === 6)
-          confirmations++;
+          let tx = await ipcExec('gettransaction', ctx.tx.txid()).catch(() => {});
+          if (!tx || !tx.confirmations )
+            tx = {confirmations: 0};
+          
+          if (tx.confirmations === 0 || tx.confirmations === 6)
+            confirmations++;
 
-        if (confirmations === 2)
-          res();
+          if (confirmations === 2)
+            res();
 
-      });
-
-      ipcExec('sendrawtransaction', [ctx.tx.toRaw().toString('hex')])
-        .then(() => {
-          let timeInterval = setInterval(function () {
-            ipcExec('generatetoaddress', [6, keyring2.getAddress().toString()]);
-            if (confirmations === 2)
-              clearInterval(timeInterval);
-          }, 2000);
         });
-
-    });
-
+      })(),
+      (async () => {
+        const res = await ipcExec('sendrawtransaction', [ctx.tx.toRaw().toString('hex')]);
+        await ipcExec('generatetoaddress', [6, keyring2.getAddress().toString()]);
+        await ipcExec('generatetoaddress', [6, keyring2.getAddress().toString()]);
+        await ipcExec('generatetoaddress', [6, keyring2.getAddress().toString()]);
+        await ipcExec('generatetoaddress', [6, keyring2.getAddress().toString()]);
+        await ipcExec('generatetoaddress', [6, keyring2.getAddress().toString()]);
+        await ipcExec('generatetoaddress', [6, keyring2.getAddress().toString()]);
+           
+      })()
+    ]);
   });
 
   it('validate balance for all accounts in mongodb', async () => {
